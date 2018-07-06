@@ -1,0 +1,923 @@
+#+TITLE: Postgresql Migrations
+#+SETUPFILE: setupfile.org
+
+#+BEGIN_SRC sql
+SELECT migration.migrate_database() ;
+#+END_SRC
+
+#+RESULTS:
+
+* Introduction 
+
+Almost everyone involved with databases knows the issue. A database is
+developed which matches all the wants prior to using it. As soon as it
+is put live, things needs changing, but with already existing data,
+there are things required in order to move on up.
+
+But wait, there's more! Development, Staging and Production all may
+use different versions of the schemata, and they may even fluctuate
+between versions.
+
+
+* Migration Concepts 
+
+A migration is simple. Basically, it consists of a number, and two SQL
+files. The number is for ordering, and the sqlfiles for up and down. 
+
+
+* Migrate the database
+
+First, we want to log them all.
+
+#+NAME: migration_log
+#+BEGIN_SRC sql
+-- DROP TABLE migration_log;
+CREATE TABLE IF NOT EXISTS migration_log (
+ time timestamp without time zone DEFAULT now (),
+ completed BOOLEAN NOT NULL DEFAULT false,
+ migration_number INTEGER NOT NULL REFERENCES migration_registry(number), 
+ direction TEXT NOT NULL DEFAULT 'up', -- or 'down'
+ error INTEGER REFERENCES migration_error(error_number) DEFAULT NULL
+);
+
+#+END_SRC
+
+Then we want to know the number of the current migration.
+
+#+NAME: migration_current_number
+#+BEGIN_SRC sql
+CREATE OR REPLACE FUNCTION migration_current_number() 
+RETURNS numeric LANGUAGE SQL AS $$
+ SELECT COALESCE(max(number), -1) FROM migration_registry WHERE status = true;
+$$ ;
+#+END_SRC
+
+#+NAME: migration_migrate_database
+#+BEGIN_SRC sql
+CREATE OR REPLACE FUNCTION migration_migrate_database
+ (_migration NUMERIC default NULL::int)
+RETURNS migration_log LANGUAGE PLPGSQL AS $$
+DECLARE 
+ _current numeric;
+ _next numeric;
+ _version numeric;
+ _direction text;
+ _error migration_error;
+ _log migration_log;
+ _completed boolean := false;
+BEGIN
+
+ _current := migration_current_number();
+ _version := $1;
+
+ -- RAISE NOTICE ' Trying current % to version %', _current, _version;
+
+ -- Up
+ IF (_version IS NULL OR (_version > _current AND _version >= 0)) THEN
+   _next := _current + 1;
+   _direction := 'up';
+
+ -- Down  
+  ELSIF (_version < _current) THEN 
+  _next := _current;
+  _direction := 'down';
+
+  -- Nothing at all, done!
+ELSE 
+  RETURN _log;
+END IF;
+
+--  RAISE EXCEPTION 'So next is  % direction %, foo%', _next, _direction, 'SELECT migration_run('||_next ||','''|| _direction||''')' ;
+
+--- Do the migration, handle any errors
+
+SELECT handle_migration_error('SELECT migration_run('||_next ||','''|| _direction||''')') 
+  INTO _error;
+
+IF (_error.error_number IS NOT NULL) THEN
+  _error.migration_number = _next;
+  _error.direction = _direction;
+  PERFORM  report_migration_error(_error);
+ELSE 
+ _completed := true;
+END IF;
+
+-- Log it.
+
+INSERT INTO migration_log(completed, migration_number, direction, error)
+  VALUES (_completed, _next, _direction, _error.error_number)
+  RETURNING migration_log.* INTO _log;
+
+-- If it failed, return now.
+
+IF (NOT _completed) THEN
+ RETURN _log;
+END IF;
+
+IF (_direction = 'down') THEN
+ _next := _next - 1;
+END IF;
+
+IF ((_version IS NULL) OR ( _version != _next AND _version != _current AND _next >= 0)) THEN
+ RETURN (SELECT migration_migrate_database(_version));
+ELSE 
+ RETURN _log;
+END IF;
+
+EXCEPTION 
+  WHEN undefined_file THEN
+   IF (_version IS NULL) THEN
+     RETURN NULL;
+   ELSE 
+    RAISE EXCEPTION 'Error %', SQLERRM USING ERRCODE = SQLSTATE ;
+  END IF;
+END; 
+$$;
+#+END_SRC
+
+#+RESULTS: migration_migrate_database
+| DROP FUNCTION   |
+|-----------------|
+| CREATE FUNCTION |
+| CREATE FUNCTION |
+
+** Usage
+
+#+BEGIN_SRC sql
+SELECT migration_migrate_database(0);
+
+ SELECT migration_migrate_database(1);
+SELECT migration_current_number() ;
+SELECT migration_migrate_database(0);
+SELECT migration_current_number() ;
+ SELECT migration_migrate_database(-1);
+SELECT migration_current_number() ;
+SELECT migration_migrate_database(2);
+
+#+END_SRC
+
+#+RESULTS:
+| migration_migrate_database               |
+|------------------------------------------|
+| ("2018-06-05 12:28:45.706428",t,0,up,)   |
+| migration_migrate_database               |
+| ("2018-06-05 12:28:45.750077",t,1,up,)   |
+| migration_current_number                 |
+| 1                                        |
+| migration_migrate_database               |
+| ("2018-06-05 12:28:45.765129",t,1,down,) |
+| migration_current_number                 |
+| 0                                        |
+| migration_migrate_database               |
+| ("2018-06-05 12:28:45.79284",t,0,down,)  |
+| migration_current_number                 |
+| -1                                       |
+| migration_migrate_database               |
+| ("2018-06-05 12:28:45.800638",t,2,up,)   |
+
+
+
+* Run a migration
+
+#+NAME: migration_run
+#+BEGIN_SRC sql
+CREATE OR REPLACE FUNCTION migration_run
+ (_m migration_registry, _direction TEXT DEFAULT 'up')
+ RETURNS migration_registry LANGUAGE SQL AS $$
+
+  SELECT CASE 
+          WHEN (_direction = 'up') THEN 
+            migration_eval(migration_read_file(_m.up))
+          WHEN (_direction = 'down') THEN 
+            migration_eval(migration_read_file(_m.down))
+	 END;
+
+  UPDATE migration_registry SET status = (_direction = 'up')
+   WHERE number = _m.number RETURNING migration_registry ;
+
+$$;
+
+CREATE OR REPLACE FUNCTION migration_run
+ (_m numeric, _direction TEXT DEFAULT 'up')
+ RETURNS migration_registry LANGUAGE SQL AS $$
+  SELECT migration_run(m, $2) FROM migration_registry AS m 
+   WHERE number = $1;
+$$;
+
+#+END_SRC
+
+#+RESULTS:
+| CREATE FUNCTION |
+|-----------------|
+| CREATE FUNCTION |
+
+** Usage 
+
+To make a migration, we need two files
+
+We'll have ~/tmp/test-up-N.sql~ and ~/tmp/test-down-N.sql~, where N is the migration number.
+
+#+BEGIN_SRC sql :tangle "/tmp/test-up-0.sql"
+CREATE TABLE test_migration (
+  number SERIAL PRIMARY KEY
+);
+#+END_SRC
+
+And the down. 
+
+#+BEGIN_SRC sql :tangle "/tmp/test-down-0.sql"
+DROP TABLE test_migration ;
+#+END_SRC
+
+#+RESULTS:
+| DROP TABLE |
+|------------|
+
+
+#+BEGIN_SRC sql :tangle "/tmp/test-up-1.sql"
+INSERT INTO test_migration  DEFAULT VALUES;
+INSERT INTO test_migration  DEFAULT VALUES;
+INSERT INTO test_migration  DEFAULT VALUES;
+#+END_SRC
+
+#+BEGIN_SRC sql :tangle "/tmp/test-down-1.sql"
+TRUNCATE test_migration ;
+#+END_SRC
+|------------|
+
+Now we'll register those files as a migration.
+
+#+BEGIN_SRC sql
+TRUNCATE migration_registry CASCADE;
+SELECT migration_setenv('ROOT_DIRECTORY', '/tmp/');
+SELECT register_migration(0, '/tmp/test-up-0.sql', '/tmp/test-down-0.sql');
+SELECT register_migration(1, 'test-up-1.sql', 'test-down-1.sql');
+#+END_SRC
+
+#+RESULTS:
+| TRUNCATE TABLE                                |
+|-----------------------------------------------|
+| migration_setenv                              |
+| /tmp/                                         |
+| register_migration                            |
+| (0,/tmp/test-up-0.sql,/tmp/test-down-0.sql,f) |
+| register_migration                            |
+| (1,test-up-1.sql,test-down-1.sql,f)           |
+
+
+Now, we migrate up to 0.
+
+#+BEGIN_SRC sql
+SELECT count(*) FROM pg_tables WHERE tablename = 'test_migration';
+
+SELECT migration_run(m, 'up') FROM migration_registry AS m 
+  WHERE not status ORDER BY number;
+
+SELECT count(*) FROM pg_tables WHERE tablename = 'test_migration';
+SELECT count(*) FROM test_migration; 
+
+SELECT migration_run(m, 'down') FROM migration_registry AS m 
+  WHERE number = 1;
+
+SELECT count(*) FROM test_migration; 
+
+SELECT migration_run(m, 'down') FROM migration_registry AS m 
+  WHERE number = 0;
+
+SELECT count(*) FROM pg_tables WHERE tablename = 'test_migration';
+#+END_SRC
+#+RESULTS:
+| count                                         |
+|-----------------------------------------------|
+| 0                                             |
+| migration_run                                 |
+| (0,/tmp/test-up-0.sql,/tmp/test-down-0.sql,t) |
+| (1,test-up-1.sql,test-down-1.sql,t)           |
+| count                                         |
+| 1                                             |
+| count                                         |
+| 3                                             |
+| migration_run                                 |
+| (1,test-up-1.sql,test-down-1.sql,f)           |
+| count                                         |
+| 0                                             |
+| migration_run                                 |
+| (0,/tmp/test-up-0.sql,/tmp/test-down-0.sql,f) |
+| count                                         |
+| 0                                             |
+
+* Evaluate 
+
+#+NAME: migration_eval
+#+BEGIN_SRC sql
+CREATE OR REPLACE FUNCTION migration_eval(text)
+  RETURNS void LANGUAGE PLPGSQL AS $$
+BEGIN
+ EXECUTE $1;
+END;
+$$;
+#+END_SRC
+
+** Usage
+#+BEGIN_SRC sql
+SELECT migration_eval('
+  CREATE TABLE foo (bar text DEFAULT ''baz'');
+  INSERT INTO foo VALUES (DEFAULT), (''bat'')');
+
+SELECT * FROM foo;
+DROP TABLE foo;
+#+END_SRC
+
+
+* Errors: Handling and reporting
+
+Errors happen. We want to handle and report them in a reasonable way.
+
+https://www.postgresql.org/docs/current/static/plpgsql-control-structures.html#PLPGSQL-ERROR-TRAPPING
+
+#+NAME: migration_error
+#+BEGIN_SRC sql
+-- DROP TABLE migration_error CASCADE;
+  CREATE TABLE IF NOT EXISTS migration_error (
+   error_number SERIAL PRIMARY KEY,
+   migration_number INTEGER,
+   direction TEXT,
+   -- the SQLSTATE error code of the exception
+   RETURNED_SQLSTATE TEXT,
+   -- the name of the column related to exception 
+   COLUMN_NAME TEXT,
+    -- the name of the constraint related to exception 
+   CONSTRAINT_NAME TEXT,
+    -- the name of the data type related to exception
+   PG_DATATYPE_NAME TEXT,
+   -- the text of the exception's primary message
+   MESSAGE_TEXT TEXT,
+   -- the name of the table related to exception
+   TABLE_NAME TEXT,
+    -- the name of the schema related to exception
+   SCHEMA_NAME TEXT,
+   --	the text of the exception's detail message, if any
+   PG_EXCEPTION_DETAIL TEXT,
+   -- the text of the exception's hint message, if any
+   PG_EXCEPTION_HINT TEXT,
+   -- line(s) of text describing the call stack at the time of the exception
+   PG_EXCEPTION_CONTEXT TEXT 
+  );
+
+#+END_SRC
+
+#+RESULTS:
+| DROP TABLE   |
+|--------------|
+| CREATE TABLE |
+
+#+NAME: migration_error
+#+BEGIN_SRC sql 
+CREATE OR REPLACE FUNCTION handle_migration_error
+ (query text) RETURNS migration_error AS $$
+DECLARE
+ -- the SQLSTATE error code of the exception
+   RETURNED_SQLSTATE TEXT ;
+   -- the name of the column related to exception 
+   COLUMN_NAME TEXT;
+    -- the name of the constraint related to exception 
+   CONSTRAINT_NAME TEXT;
+    -- the name of the data type related to exception
+   PG_DATATYPE_NAME TEXT;
+   -- the text of the exception's primary message
+   MESSAGE_TEXT TEXT;
+   -- the name of the table related to exception
+   TABLE_NAME TEXT;
+    -- the name of the schema related to exception
+   SCHEMA_NAME TEXT;
+   --	the text of the exception's detail message; if any
+   PG_EXCEPTION_DETAIL TEXT;
+   -- the text of the exception's hint message; if any
+   PG_EXCEPTION_HINT TEXT;
+   -- line(s) of text describing the call stack at the time of the exception
+   PG_EXCEPTION_CONTEXT TEXT ;
+  stack text;
+  msg text;
+BEGIN
+ 
+   EXECUTE $1 ;
+  RETURN null::migration_error;
+ EXCEPTION WHEN OTHERS THEN 
+ GET STACKED DIAGNOSTICS 
+   RETURNED_SQLSTATE = RETURNED_SQLSTATE,
+   COLUMN_NAME = COLUMN_NAME,
+   CONSTRAINT_NAME = CONSTRAINT_NAME,
+   PG_DATATYPE_NAME = PG_DATATYPE_NAME,
+   MESSAGE_TEXT = MESSAGE_TEXT,
+   TABLE_NAME = TABLE_NAME,
+   SCHEMA_NAME = SCHEMA_NAME,
+   PG_EXCEPTION_DETAIL = PG_EXCEPTION_DETAIL,
+   PG_EXCEPTION_HINT = PG_EXCEPTION_HINT,
+   PG_EXCEPTION_CONTEXT = PG_EXCEPTION_CONTEXT;
+
+ RETURN ROW(null, null, null, RETURNED_SQLSTATE,
+   COLUMN_NAME,
+   CONSTRAINT_NAME,
+   PG_DATATYPE_NAME,
+   MESSAGE_TEXT,
+   TABLE_NAME,
+   SCHEMA_NAME,
+   PG_EXCEPTION_DETAIL,
+   PG_EXCEPTION_HINT,
+   PG_EXCEPTION_CONTEXT)::migration_error;
+
+   
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION report_migration_error(_me migration_error)
+ RETURNS migration_error LANGUAGE sql AS $$ 
+  INSERT INTO migration_error
+     (migration_number, direction,
+      RETURNED_SQLSTATE,
+      COLUMN_NAME,
+      CONSTRAINT_NAME,
+      PG_DATATYPE_NAME,
+      MESSAGE_TEXT,
+      TABLE_NAME,
+      SCHEMA_NAME,
+      PG_EXCEPTION_DETAIL,
+      PG_EXCEPTION_HINT,
+      PG_EXCEPTION_CONTEXT)
+   VALUES (_me.migration_number, _me.direction,
+      _me.RETURNED_SQLSTATE,
+      _me.COLUMN_NAME,
+      _me.CONSTRAINT_NAME,
+      _me.PG_DATATYPE_NAME,
+      _me.MESSAGE_TEXT,
+      _me.TABLE_NAME,
+      _me.SCHEMA_NAME,
+      _me.PG_EXCEPTION_DETAIL,
+      _me.PG_EXCEPTION_HINT,
+      _me.PG_EXCEPTION_CONTEXT)
+  RETURNING migration_error ;
+$$;
+#+END_SRC
+
+#+RESULTS:
+| CREATE FUNCTION                                                                                                                                                                                                      |          |
+|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------|
+| CREATE FUNCTION                                                                                                                                                                                                      |          |
+| TRUNCATE TABLE                                                                                                                                                                                                       |          |
+| INSERT 0 1                                                                                                                                                                                                           |          |
+| report_migration_error                                                                                                                                                                                               | ?column? |
+| (1,,,23505,"",test_error_pkey,"","duplicate key value violates unique constraint ""test_error_pkey""",test_error,public,"Key (number)=(0) already exists.","","SQL statement ""INSERT INTO test_error VALUES (0) ;"" |          |
+| PL/pgSQL function handle_migration_error(text) line 27 at EXECUTE")                                                                                                                                                  | t        |
+
+#+BEGIN_SRC sql
+DROP TABLE migration_error;
+
+#+END_SRC
+
+#+RESULTS:
+| DROP TABLE |
+|------------|
+
+* Read files
+  :PROPERTIES:
+  :CUSTOM_ID: migration_read_files
+  :END:
+
+In the [[#migration_registry][Migration Registry]], there are two pathnames, up and down, which
+point to a .sql file.
+
+** /Function/ migration_read_file
+
+Reading a file into a string is quite simple. We use the Postgreql
+[[https://www.postgresql.org/docs/current/static/sql-copy.html][COPY]] command, which is meant to load a file, like a ~.csv~, into a
+table.
+
+We (ab)use that to return the contents of one file as a string. It
+wants a delimiter between columns. We only want one column. As luck
+would have it, [[https://en.wikipedia.org/wiki/Delimiter#ASCII_delimited_text][ASCII]] has prepared for that with a ~Unit Separator~,
+char code 31.
+
+It also makes every line a row. We get around that with
+~string_agg(content,chr(10))~.
+
+
+#+BEGIN_SRC sql :results drawer
+CREATE TEMP TABLE _file (content text) ;
+COPY _file FROM '/tmp/up.sql'
+SELECT string_agg(content,chr(10)) AS contents from _file;
+#+END_SRC
+
+#+BEGIN_EXAMPLE
+CREATE TABLE
+COPY 3
+contents
+CREATE TABLE test_migration (
+  number SERIAL PRIMARY KEY
+);
+#+END_EXAMPLE
+
+That can be made into a simple function.  We'll also look at the
+[[#migration_environment][Environment]] variable ~ROOT_DIRECTORY~ if the pathname is relative.
+
+#+NAME: migration_read_file
+#+BEGIN_SRC sql
+  --DROP FUNCTION migration_read_file(text);
+  CREATE OR REPLACE FUNCTION migration_read_file(_pathname text)
+    RETURNS text AS $$
+      DECLARE
+	content text;
+	tmp text;
+	root_directory text := '';
+      BEGIN
+	-- First, make the pathname proper.
+	-- If it is relative, getenv('ROOT_DIRECTORY');
+	IF ((left(_pathname, 1)) != '/') THEN 
+	  SELECT migration_getenv('ROOT_DIRECTORY') INTO root_directory; 
+
+	  -- If there's none, make it an empty string. The path will be
+	  -- interpreted relative to the working directory of the server
+	  -- process (normally the cluster's data directory), not the
+	  -- client's working directory.
+
+ 	  IF (root_directory IS NULL) THEN root_directory := '' ;
+
+	  -- If there's a root directory that's not '', make sure it ends
+	  -- with a slash.
+
+	  ELSIF (root_directory != '') THEN 
+	  root_directory := trim( trailing '/' from root_directory) || '/' ;
+	  END IF;
+
+	END IF;
+	_pathname := quote_literal(root_directory||_pathname);
+
+	SELECT array_to_string(ARRAY(SELECT chr((65 + round(random() * 25)) :: integer) 
+	 INTO tmp
+	 FROM generate_series(1,7)), '');
+
+	tmp := quote_ident(tmp);
+
+	EXECUTE 'CREATE TEMP TABLE ' || tmp || ' (content text)';
+	EXECUTE 'COPY ' || tmp || ' FROM ' || _pathname ||' WITH DELIMITER E''\031''';
+	EXECUTE 'SELECT string_agg(content,chr(10)) FROM ' || tmp INTO content;
+	EXECUTE 'DROP TABLE ' || tmp;
+
+	RETURN content;
+      END;
+    $$ LANGUAGE plpgsql VOLATILE;
+#+END_SRC
+
+#+RESULTS: migration_read_file
+| CREATE FUNCTION |
+|-----------------|
+
+
+** Usage
+So, we'll make them in ~/tmp/~ and make a ~VIEW~ to view them.
+
+First the up: 
+
+#+BEGIN_SRC sql :tangle "/tmp/up.sql"
+CREATE TABLE test_migration (
+  number SERIAL PRIMARY KEY
+);
+#+END_SRC
+
+And the down. 
+
+#+BEGIN_SRC sql :tangle "/tmp/down.sql"
+DROP TABLE test_migration ;
+#+END_SRC
+
+#+RESULTS:
+
+
+** Usage
+
+#+BEGIN_SRC sql
+
+SELECT migration_read_file('/tmp/up.sql')
+      ,migration_read_file('/tmp/down.sql') ;
+
+#+END_SRC
+
+#+RESULTS:
+| migration_read_file           | migration_read_file         |
+|-------------------------------+-----------------------------|
+| CREATE TABLE test_migration ( |                             |
+| number SERIAL PRIMARY KEY     |                             |
+| );                            | DROP TABLE test_migration ; |
+
+* Environment
+  :PROPERTIES:
+  :CUSTOM_ID: migration_environment
+  :END:
+
+We want environment variables. What I want is `dirname` so I can have
+relative paths, but I'm sure there's more.
+
+** ~env~
+
+Posix has all the names and functions, so we go with them. 
+
+The ~migration_env~ table stores the environment.
+
+#+NAME: migration_env
+#+BEGIN_SRC sql
+CREATE TABLE IF NOT EXISTS migration_env (
+ name TEXT PRIMARY KEY, 
+ value TEXT);
+
+#+END_SRC
+
+
+The ~env~ function, run without arguments, returns a json object with
+the entire ENV.
+#+NAME: migration_env
+#+BEGIN_SRC sql
+CREATE OR REPLACE FUNCTION migration_env ()
+ RETURNS json LANGUAGE SQL AS $$
+  SELECT json_object_agg(env.name, env.value) AS env
+  FROM migration_env AS env;
+ $$;
+
+#+END_SRC
+
+*** Testing
+
+#+BEGIN_SRC sql
+BEGIN; 
+INSERT INTO migration_env(name, value) VALUES ('foo', 'bar'), ('baz', 'bat');
+SELECT migration_env();
+ABORT;
+#+END_SRC
+
+#+RESULTS:
+| BEGIN                            |
+|----------------------------------|
+| INSERT 0 2                       |
+| migration_env                    |
+| { "foo" : "bar", "baz" : "bat" } |
+| ROLLBACK                         |
+
+** ~getenv~
+
+This is pretty simple.
+#+NAME: migration_env
+#+BEGIN_SRC sql
+CREATE OR REPLACE FUNCTION migration_getenv (name TEXT)
+ RETURNS TEXT LANGUAGE SQL AS $$
+  SELECT env.value FROM migration_env AS env 
+   WHERE env.name = $1;
+ $$;
+
+#+END_SRC
+
+** ~setenv~, ~unsetenv~
+
+*** ~setenv~
+The ~setenv~ function adds the variable name to the environment with
+the value, if name does not already exist.  If name does exist
+in the environment, then its value is changed to value if overwrite is
+true; if overwrite is false, then the value of name is not changed
+(and setenv() returns the actual value). 
+
+This uses the new UPSERT capabilites. Yay!
+#+NAME: migration_env
+#+BEGIN_SRC sql
+CREATE OR REPLACE FUNCTION migration_setenv
+   (name text, value text, overwrite BOOLEAN DEFAULT true)
+ RETURNS TEXT LANGUAGE SQL AS $$ 
+
+ INSERT INTO migration_env(name, value) 
+  VALUES ($1, $2)
+  ON CONFLICT (name) DO 
+   UPDATE SET value = EXCLUDED.value 
+  WHERE $3 AND migration_env.name = EXCLUDED.name;
+ 
+ SELECT migration_getenv($1);
+
+$$;
+
+#+END_SRC
+
+#+RESULTS:
+| CREATE FUNCTION |
+|-----------------|
+
+**** Examples 
+
+#+BEGIN_SRC sql
+BEGIN; 
+SELECT migration_setenv('foo', 'bar')
+     , migration_setenv('baz', 'bat')
+     , migration_setenv('xyzzy', 'asd');
+
+SELECT migration_env();
+
+SELECT migration_setenv('foo', 'qwerty');
+
+SELECT migration_env();
+
+SELECT migration_setenv('foo', 'bar', false);
+
+SELECT migration_env();
+ABORT;
+#+END_SRC
+
+#+RESULTS:
+| BEGIN                                                |                  |                  |
+|------------------------------------------------------+------------------+------------------|
+| migration_setenv                                     | migration_setenv | migration_setenv |
+| bar                                                  | bat              | asd              |
+| migration_env                                        |                  |                  |
+| { "foo" : "bar", "baz" : "bat", "xyzzy" : "asd" }    |                  |                  |
+| migration_setenv                                     |                  |                  |
+| qwerty                                               |                  |                  |
+| migration_env                                        |                  |                  |
+| { "baz" : "bat", "xyzzy" : "asd", "foo" : "qwerty" } |                  |                  |
+| migration_setenv                                     |                  |                  |
+| qwerty                                               |                  |                  |
+| migration_env                                        |                  |                  |
+| { "baz" : "bat", "xyzzy" : "asd", "foo" : "qwerty" } |                  |                  |
+| ROLLBACK                                             |                  |                  |
+
+*** ~unsetenv~
+
+The unsetenv() function deletes the variable name from the
+environment.  If name does not exist in the environment, then the
+function succeeds, and the environment is unchanged.
+
+#+NAME: migration_env
+#+BEGIN_SRC sql
+CREATE OR REPLACE FUNCTION migration_unsetenv (name TEXT)
+ RETURNS BOOLEAN LANGUAGE SQL AS $$
+  DELETE FROM migration_env AS env 
+   WHERE env.name = $1;
+  SELECT TRUE;
+ $$;
+#+END_SRC
+
+#+RESULTS:
+| CREATE FUNCTION |
+|-----------------|
+
+**** Examples
+
+#+BEGIN_SRC sql
+BEGIN; 
+SELECT migration_setenv('foo', 'bar')
+     , migration_setenv('baz', 'bat');
+
+SELECT migration_env();
+
+SELECT migration_unsetenv('foo');
+
+SELECT migration_env();
+ABORT;
+#+END_SRC
+
+#+RESULTS:
+| BEGIN                            |                  |
+|----------------------------------+------------------|
+| migration_setenv                 | migration_setenv |
+| bar                              | bat              |
+| migration_env                    |                  |
+| { "foo" : "bar", "baz" : "bat" } |                  |
+| migration_usetenv                |                  |
+| t                                |                  |
+| migration_env                    |                  |
+| { "baz" : "bat" }                |                  |
+| ROLLBACK                         |                  |
+
+
+* Migration Registry
+  :PROPERTIES:
+  :CUSTOM_ID: migration_registry
+  :END:
+
+#+NAME: migration_registry_table
+#+BEGIN_SRC sql
+ -- DROP TABLE migration_registry CASCADE;
+CREATE TABLE IF NOT EXISTS migration_registry (
+ number numeric PRIMARY KEY, 
+ up TEXT NOT NULL,
+ down TEXT NOT NULL,
+ status BOOLEAN NOT NULL DEFAULT false
+);
+#+END_SRC
+
+#+RESULTS:
+| DROP TABLE   |
+|--------------|
+| CREATE TABLE |
+
+A ~register_migration(n,up,down,overwrite)~ function is added. If
+~overwrite~ is false, and it exists, and error is raised. 
+
+If the status of the existing migration is ~true~, meaning it has been
+run, it cannot be registered and an error is raised as well.
+
+#+NAME: register_migration
+#+BEGIN_SRC sql
+  CREATE OR REPLACE FUNCTION register_migration
+    (_number NUMERIC, _up TEXT, _down TEXT, _overwrite BOOLEAN DEFAULT false)
+   RETURNS migration_registry LANGUAGE PLPGSQL AS $$
+   DECLARE 
+    _exists migration_registry;
+   BEGIN
+
+    SELECT r.* INTO _exists 
+     FROM migration_registry AS r
+    WHERE r.number = $1; 
+
+    IF ((NOT $4) AND _exists.number IS NOT NULL) THEN
+     RAISE EXCEPTION 'ERROR: Migration % exists.
+       If you want to overwrite it, set overwrite to gtrue.',$1 ;
+    ELSEIF (_exists.status) THEN
+     RAISE EXCEPTION 'ERROR: Migration % has aleady been run. Cannot Overwrite',$1 ;
+    END IF;
+
+   IF (_exists.status IS NULL) THEN
+    INSERT INTO migration_registry(number, up, down)
+     VALUES ($1, $2, $3);
+   ELSE
+    UPDATE migration_registry AS r SET up = $2, down=$3 WHERE r.number = $1;
+   END IF;
+
+   SELECT r.* INTO _exists 
+     FROM migration_registry AS r
+    WHERE r.number = $1; 
+
+   RETURN _exists ;
+
+   END; $$; 
+
+#+END_SRC
+
+#+RESULTS:
+| CREATE FUNCTION |
+|-----------------|
+
+We also have one that automatically takes the next number.
+
+#+NAME: register_migration
+#+BEGIN_SRC sql
+  CREATE OR REPLACE FUNCTION register_migration
+    (_up TEXT, _down TEXT, _overwrite BOOLEAN DEFAULT false)
+   RETURNS migration_registry LANGUAGE SQL AS $$
+   SELECT register_migration((1 + (select COALESCE(max(number), -1) FROM migration_registry))
+			     ,$1,$2,$3) ;
+  $$;
+#+END_SRC
+
+#+RESULTS:
+| CREATE FUNCTION |
+|-----------------|
+
+** Examples
+
+#+BEGIN_SRC sql 
+TRUNCATE migration_registry ;
+SELECT * FROM register_migration('schemata.sql', 'clean-schemata.sql');
+#+END_SRC
+
+#+RESULTS:
+| TRUNCATE TABLE |              |                    |        |
+|----------------+--------------+--------------------+--------|
+| number         | up           | down               | status |
+| 0              | schemata.sql | clean-schemata.sql | f      |
+
+
+
+
+* migration--0.0.1.sql :: The sql File 
+
+#+BEGIN_SRC sql :noweb yes :tangle "../migration--0.0.1.sql"
+
+-- Migrations :: (c) Drew Crampsie - 2018
+-- Contact: me@drewc.ca
+
+<<migration_registry_table>>
+
+<<register_migration>>
+
+<<migration_env>>
+
+<<migration_read_file>>
+
+<<migration_error>>
+
+<<migration_eval>>
+
+<<migration_run>>
+
+<<migration_log>>
+
+<<migration_current_number>>
+
+<<migration_migrate_database>>
+#+END_SRC
+
+

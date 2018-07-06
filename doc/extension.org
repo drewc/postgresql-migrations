@@ -1,0 +1,49 @@
+#+TITLE: Packaging Related Objects into an Extension
+#+SETUPFILE: setupfile.org
+
+This is our[fn:royalwe] first postgresql extension. Here be dragons.
+
+* Introduction 
+
+https://www.postgresql.org/docs/current/static/extend-extensions.html
+
+"To be able to run the CREATE EXTENSION command in your database, your
+extension needs at least two files: a control file in the format
+extension_name.control, which tells Postgres some basics about your
+extension, and a extension’s SQL script file in the format
+extension--version.sql" 
+  --http://big-elephants.com/2015-10/writing-postgres-extensions-part-i/
+
+#+BEGIN_SRC shell
+sudo apt-get install libpq-dev postgresql-server-dev-all
+#+END_SRC
+
+* migration.control
+
+#+BEGIN_SRC conf :tangle "../migration.control"
+  # Migration Extension
+  comment = 'Database Migrations: Configure and Run'
+  default_version = '0.0.1'
+  relocatable = true
+#+END_SRC
+
+
+* Makefile 
+
+#+BEGIN_SRC makefile :tangle "../Makefile"
+  EXTENSION = migration        # the extensions name
+  DATA = migration--0.0.1.sql  # script files to install
+
+  # postgres build stuff
+  PG_CONFIG = pg_config
+  PGXS := $(shell $(PG_CONFIG) --pgxs)
+  include $(PGXS)
+#+END_SRC
+
+
+* Footnotes
+
+[fn:royalwe] The royal we, or majestic plural (pluralis maiestatis), is the
+use of a plural pronoun (or corresponding plural-inflected verb forms)
+to refer to a single person holding a high office, such as a sovereign
+monarch or religious leader like the Pope.

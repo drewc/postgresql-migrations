@@ -1,0 +1,4 @@
+# Migration Extension
+comment = 'Database Migrations: Configure and Run'
+default_version = '0.0.1'
+relocatable = true

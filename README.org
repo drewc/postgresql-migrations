@@ -1,0 +1,37 @@
+Postgresql Migrations
+
+A Postgresql Extension for Database Migrations. Up, Down and all
+around.
+
+* Installation
+
+First, clone the git. 
+
+#+BEGIN_SRC shell
+git clone git@github.com:drewc/postgresql-migrations.git
+#+END_SRC
+
+It could now be simply copied over to ~SHAREDIR/extension~, but
+really, should be built.  So, make sure the libs are installed in
+order to `make` is so.
+
+#+BEGIN_SRC shell
+sudo apt-get install libpq-dev postgresql-server-dev-all
+#+END_SRC
+
+Change to the source directory and `make install`.
+
+#+BEGIN_SRC shell
+sudo make install
+#+END_SRC
+
+** ~CREATE EXTENSION migration~
+
+Now the objects must be loaded into the database.
+
+#+BEGIN_SRC sql
+CREATE EXTENSION migration;
+#+END_SRC
+
+
+
